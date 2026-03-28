@@ -1,0 +1,7 @@
+py-clob-client==0.34.6
+websockets>=12.0
+httpx>=0.25.0
+supabase>=2.0.0
+web3>=6.0.0
+python-dotenv>=1.0.0
+prometheus_client>=0.20.0
