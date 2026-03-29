@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
     "fractional_kelly": 0.25,
     "min_aggregate_confidence": 0.40,
     "min_edge_bps": 50.0,
-    "max_position_pct": 0.15,
+    "max_position_pct": 0.03,
     "min_bet_usd": 1.0,
 
     # ── Signal Weights ────────────────────────────────
@@ -417,6 +417,8 @@ class StrategyOrchestrator:
         self.chainlink_tracker._supabase = supabase_client
         # Load config from bot_config table (overrides DEFAULT_CONFIG)
         self.reload_config()
+        # Propagate loaded config into PositionSizer (created before reload_config ran)
+        self._sync_position_sizer()
         logger.info(f"Supabase logging enabled (mode={mode})")
 
     def reload_config(self):
@@ -445,8 +447,9 @@ class StrategyOrchestrator:
                         changed.append(f"{key}: {old} → {new}")
 
             if changed:
-                # Re-apply config to ensemble engine
+                # Re-apply config to ensemble engine and oracle position sizer
                 self.ensemble.update_bankroll(self.config["bankroll"])
+                self._sync_position_sizer()
                 self._config_version += 1
                 logger.info(f"Config reloaded from bot_config (v{self._config_version}): {', '.join(changed)}")
         except Exception as e:
@@ -725,6 +728,15 @@ class StrategyOrchestrator:
 
         return decision
 
+    def _sync_position_sizer(self):
+        """Propagate current config values into the PositionSizer."""
+        c = self.config
+        self.position_sizer.bankroll = float(c.get("bankroll", self.position_sizer.bankroll))
+        self.position_sizer.max_size_pct = float(c.get("max_position_pct", self.position_sizer.max_size_pct))
+        self.position_sizer.min_size_pct = float(c.get("min_position_pct", self.position_sizer.min_size_pct))
+        self.position_sizer.fractional_kelly = float(c.get("fractional_kelly", self.position_sizer.fractional_kelly))
+        self.position_sizer.max_daily_loss_pct = float(c.get("max_daily_loss_pct", self.position_sizer.max_daily_loss_pct))
+
     def update_bankroll(self, new_bankroll: float, persist: bool = True):
         """Update bankroll after trade settlement.
 
@@ -734,6 +746,7 @@ class StrategyOrchestrator:
         """
         self.config["bankroll"] = new_bankroll
         self.ensemble.update_bankroll(new_bankroll)
+        self.position_sizer.update_bankroll(new_bankroll)
         self._peak_bankroll = max(self._peak_bankroll, new_bankroll)
         # Persist to bot_config so paper bankroll survives restarts
         if persist and hasattr(self, '_supabase') and self._supabase:
@@ -767,18 +780,18 @@ class StrategyOrchestrator:
             )
         return {}
 
-    def log_settlement(self, actual_outcome: str, won: bool, pnl: float):
+    def log_settlement(self, actual_outcome: str, won: bool, pnl: float, ensemble_id: str = None):
         """
         Log market settlement to update signal correctness.
-        
+
         Call this after a market resolves:
-        
+
             orchestrator.log_settlement("UP", won=True, pnl=0.48)
         """
-        if self._sb_logger and self._last_ensemble_id:
-            self._sb_logger.log_settlement(
-                self._last_ensemble_id, actual_outcome, won, pnl,
-            )
+        if self._sb_logger:
+            eid = ensemble_id or self._last_ensemble_id
+            if eid:
+                self._sb_logger.log_settlement(eid, actual_outcome, won, pnl)
 
     def flush_logs(self):
         """Force flush any buffered Supabase writes."""

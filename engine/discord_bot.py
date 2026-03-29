@@ -50,6 +50,7 @@ import time
 import threading
 from datetime import datetime, timezone
 
+import anthropic
 import httpx
 from supabase import create_client, Client
 
@@ -150,6 +151,7 @@ class DiscordController:
             "!signals": self._cmd_signals,
             "!edge": self._cmd_edge,
             "!brain": self._cmd_brain,
+            "!reason": self._cmd_reason,
             "!redeem": self._cmd_redeem,
             "!kill": self._cmd_kill,
             "!help": self._cmd_help,
@@ -794,6 +796,133 @@ class DiscordController:
 
         self._send("\n".join(lines))
 
+    def _cmd_reason(self, args: str):
+        import re
+        trade_id = args.strip()
+        if not trade_id:
+            self._send("**Usage:** `!reason <trade_id>`\nExample: `!reason 0b6313d1-c09b-4b74-a4ba-182eb8c917a1`")
+            return
+
+        UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+        if not UUID_RE.match(trade_id):
+            self._send(
+                f"❌ `{trade_id[:30]}...` is not a valid trade UUID.\n"
+                "Use the `id` column from `paper_trades` (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), "
+                "not a transaction hash."
+            )
+            return
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            self._send("❌ `ANTHROPIC_API_KEY` env var not set.")
+            return
+
+        self._send(f"🔍 Fetching trade `{trade_id[:8]}...` — asking Claude...")
+
+        mode = self._get_mode()
+        trade_table = "paper_trades" if mode == "paper" else "live_trades"
+
+        # Fetch trade row
+        try:
+            resp = self.sb.table(trade_table).select("*").eq("id", trade_id).limit(1).execute()
+            trade = resp.data[0] if resp.data else None
+        except Exception as e:
+            self._send(f"❌ Could not fetch trade: {e}")
+            return
+
+        if not trade:
+            # Try by market_id as fallback
+            try:
+                resp = self.sb.table(trade_table).select("*").eq("market_id", trade_id).limit(1).execute()
+                trade = resp.data[0] if resp.data else None
+            except Exception:
+                pass
+
+        if not trade:
+            self._send(f"❌ No trade found with id `{trade_id}`")
+            return
+
+        # Fetch ensemble_log row
+        ensemble = {}
+        ensemble_id = trade.get("ensemble_id")
+        if ensemble_id:
+            try:
+                resp = self.sb.table("ensemble_log").select("*").eq("id", ensemble_id).limit(1).execute()
+                ensemble = resp.data[0] if resp.data else {}
+            except Exception:
+                pass
+
+        # Fetch signal_log rows
+        signals = []
+        if ensemble_id:
+            try:
+                resp = self.sb.table("signal_log").select(
+                    "signal_name, direction, confidence, estimated_edge_bps, "
+                    "magnitude, is_actionable, agreed_with_ensemble, was_correct, metadata"
+                ).eq("ensemble_id", ensemble_id).execute()
+                signals = resp.data or []
+            except Exception:
+                pass
+
+        # Build prompt
+        prompt = f"""You are analyzing a trade made by an automated prediction market bot on Polymarket.
+The bot trades 5-minute Bitcoin Up/Down binary markets using Chainlink oracle price data.
+
+TRADE DATA:
+- Market: {trade.get('market_question', 'BTC 5-min Up/Down')}
+- Direction: {trade.get('implied_direction')} ({trade.get('side')})
+- Decision: {trade.get('decision')}
+- Fill Price: ${trade.get('hypothetical_price')}
+- Size: ${trade.get('hypothetical_size_usdc')} ({trade.get('size_pct') or '?'} of bankroll)
+- Seconds Remaining: {trade.get('seconds_remaining')}s
+- Trade Reason: {trade.get('trade_reason')}
+- Chainlink Price: ${trade.get('chainlink_price')}
+- Chainlink Window Open: ${trade.get('chainlink_window_open')}
+- Chainlink Move: {trade.get('chainlink_move_pct')}%
+- Fair Value: {trade.get('fair_value_at_trade')}
+- Edge at Fill: {trade.get('edge_at_fill')}%
+- Regime: {trade.get('regime')} (multiplier: {trade.get('regime_multiplier')})
+- Bankroll at Trade: ${trade.get('bankroll_at_trade')}
+- Outcome: {"WON ✅" if trade.get('won') else ("LOST ❌" if trade.get('won') is False else "UNSETTLED ⏳")}
+- PnL: ${trade.get('pnl_usdc')}
+
+ENSEMBLE DECISION (signal aggregation layer):
+- Should Trade: {ensemble.get('should_trade')}
+- Reason: {ensemble.get('reason')}
+- Aggregate Confidence: {ensemble.get('aggregate_confidence')}
+- Weighted Edge: {ensemble.get('weighted_edge_bps')} bps
+- Direction: {ensemble.get('direction')}
+
+SIGNALS EVALUATED ({len(signals)} total):
+{chr(10).join(f"- {s['signal_name']}: {s['direction']} | conf={s['confidence']} | edge={s['estimated_edge_bps']}bps | actionable={s['is_actionable']} | metadata={s.get('metadata','{}')}" for s in signals) if signals else "No signal data available"}
+
+In 3-5 concise sentences, explain:
+1. What data pattern triggered this trade
+2. Why the oracle strategy decided to trade (or why it traded despite the ensemble saying no)
+3. Whether the trade logic appears sound given the data
+"""
+
+        # Call Claude
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            analysis = message.content[0].text.strip()
+        except Exception as e:
+            self._send(f"❌ Claude API error: {e}")
+            return
+
+        outcome_str = "✅ WON" if trade.get("won") else ("❌ LOST" if trade.get("won") is False else "⏳ Pending")
+        header = (
+            f"🧠 **Trade Analysis** `{trade_id[:8]}...`\n"
+            f"**{trade.get('implied_direction')}** @ ${trade.get('hypothetical_price')} | "
+            f"${trade.get('hypothetical_size_usdc')} | {trade.get('seconds_remaining')}s rem | {outcome_str}\n\n"
+        )
+        self._send(header + analysis)
+
     def _cmd_brain(self, args: str):
         tier = args.strip()
         if tier not in ("1", "2", "3"):
@@ -878,7 +1007,9 @@ class DiscordController:
             "🧠 **Brain**\n"
             "`!brain 1` — Market intelligence\n"
             "`!brain 2` — Quant analysis\n"
-            "`!brain 3` — Strategy discovery"
+            "`!brain 3` — Strategy discovery\n\n"
+            "🤖 **AI Analysis**\n"
+            "`!reason <trade_id>` — Ask Claude why a trade was taken"
         )
 
     # ── Helpers ──────────────────────────────────────────────
@@ -924,6 +1055,56 @@ class DiscordController:
             self._send(f"{emoji} Mode switched to **{mode.upper()}**")
         except Exception as e:
             self._send(f"❌ Mode switch failed: {e}")
+            return
+
+        # Update BOT_MODE env var on Railway Engine service and trigger redeploy
+        railway_token = os.environ.get("RAILWAY_API_TOKEN")
+        project_id = os.environ.get("RAILWAY_PROJECT_ID", "b4bf8ba6-2b14-4d42-9eba-7b38e4967d60")
+        service_id = os.environ.get("RAILWAY_ENGINE_SERVICE_ID", "ceda9a40-7ec6-4015-a1ba-f2a80d10a67f")
+        environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID")
+
+        if not railway_token or not environment_id:
+            self._send("⚠️ Railway env vars not set (`RAILWAY_API_TOKEN`, `RAILWAY_ENVIRONMENT_ID`) — engine not redeployed. Change `BOT_MODE` in Railway manually.")
+            return
+
+        gql = "https://backboard.railway.app/graphql/v2"
+        headers = {"Authorization": f"Bearer {railway_token}", "Content-Type": "application/json"}
+
+        # Update BOT_MODE variable
+        upsert_query = """
+        mutation($input: VariableUpsertInput!) {
+          variableUpsert(input: $input)
+        }
+        """
+        try:
+            self._http.post(gql, json={
+                "query": upsert_query,
+                "variables": {"input": {
+                    "projectId": project_id,
+                    "environmentId": environment_id,
+                    "serviceId": service_id,
+                    "name": "BOT_MODE",
+                    "value": mode.upper(),
+                }},
+            }, headers=headers)
+        except Exception as e:
+            self._send(f"⚠️ Could not update Railway BOT_MODE: {e}")
+            return
+
+        # Trigger redeploy
+        redeploy_query = """
+        mutation($serviceId: String!, $environmentId: String!) {
+          serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
+        }
+        """
+        try:
+            self._http.post(gql, json={
+                "query": redeploy_query,
+                "variables": {"serviceId": service_id, "environmentId": environment_id},
+            }, headers=headers)
+            self._send("🚀 Engine redeploying with new mode... (~2-3 min)")
+        except Exception as e:
+            self._send(f"⚠️ Redeploy trigger failed: {e}")
 
     @staticmethod
     def _fmt_time(iso_str: str) -> str:

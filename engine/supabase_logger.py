@@ -143,7 +143,7 @@ class SupabaseSignalLogger:
             self._write_ensemble(ensemble_id, decision, regime, market_context, feed_state, config_version)
 
             # 3. Log regime if changed
-            self._maybe_log_regime(regime, feed_state)
+            self._maybe_log_regime(regime, feed_state, market_context)
 
             # 4. Flush signal queue if needed
             if (len(self._signal_queue) >= self._batch_size or
@@ -273,12 +273,13 @@ class SupabaseSignalLogger:
 
     # ── Regime Logging ────────────────────────────────────
 
-    def _maybe_log_regime(self, regime: RegimeState, feed_state: FeedState):
+    def _maybe_log_regime(self, regime: RegimeState, feed_state: FeedState, market_context: Dict = None):
         """Log regime snapshot only when regime label changes."""
         if regime.label == self._last_regime_label:
             return
 
         self._last_regime_label = regime.label
+        ctx = market_context or {}
 
         row = {
             "regime": regime.label,
@@ -289,6 +290,11 @@ class SupabaseSignalLogger:
             "binance_price": feed_state.binance_btc,
             "chainlink_price": feed_state.chainlink_btc,
             "oracle_gap_pct": feed_state.oracle_gap_pct,
+            "best_bid": ctx.get("best_bid"),
+            "best_ask": ctx.get("best_ask"),
+            "spread": ctx.get("spread"),
+            "bid_depth_5": ctx.get("bid_depth_5"),
+            "ask_depth_5": ctx.get("ask_depth_5"),
         }
 
         try:
@@ -324,17 +330,6 @@ class SupabaseSignalLogger:
             "regime": decision.regime,
             "contributing_signals": contributing_names,
             "signal_count": len(decision.contributing_signals or []),
-            # v4 columns
-            "fair_value_at_trade": getattr(decision, 'fair_value', None),
-            "edge_at_fill": getattr(decision, 'edge_at_fill', None),
-            "simulated_fill_price": getattr(decision, 'fill_price', None),
-            "taker_fee_estimate": getattr(decision, 'size_usd', 0) * 0.0156 if hasattr(decision, 'size_usd') else None,
-            "execution_mode": getattr(decision, 'execution_mode', None),
-            "coinbase_price": getattr(decision, 'coinbase_price', None),
-            "deribit_pcr": getattr(decision, 'pcr_adjustment', None),
-            "ltp_velocity_30s": getattr(decision, 'tick_velocity', None),
-            "sentiment_bias": getattr(decision, 'sentiment_adjustment', None),
-            "size_pct": getattr(decision, 'size_pct', None),
         }
 
     # ── Settlement Updates ────────────────────────────────

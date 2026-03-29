@@ -197,9 +197,12 @@ class V4Executor:
             )
 
         # Calculate order price
-        # For YES buys: we want to buy below our estimate of fair value
-        # For NO buys: same logic, buy NO below fair value
-        price = self._compute_limit_price(decision, side_label)
+        # Oracle path: use validated fill_price from estimate_fill_price() directly
+        # Ensemble path: compute from confidence skew (legacy)
+        if hasattr(decision, 'fill_price') and decision.fill_price and decision.fill_price > 0:
+            price = round(float(decision.fill_price), 2)
+        else:
+            price = self._compute_limit_price(decision, side_label)
 
         # Entry price cap gate: reject trades with unrealistically high entry prices.
         # A price above $0.60 leaves almost no margin and risks negative EV.
@@ -214,20 +217,22 @@ class V4Executor:
                 fill_status="SKIPPED",
             )
 
-        size = decision.recommended_size_usd
+        # Oracle path uses size_usd; ensemble path uses recommended_size_usd
+        if hasattr(decision, 'size_usd') and decision.size_usd and decision.size_usd > 0:
+            size = decision.size_usd
+        else:
+            size = decision.recommended_size_usd
 
-        # Decide postOnly
-        # Use aggressive (taker) fills for stale quote snipes, maker for everything else
+        # Decide postOnly — oracle trades always taker (guaranteed fill)
         is_stale_snipe = any(
             s.signal_name == "STALE_QUOTE"
-            for s in (decision.contributing_signals or [])
+            for s in (getattr(decision, 'contributing_signals', None) or [])
         )
         post_only = self._use_post_only and not is_stale_snipe
 
         logger.info(
             f"Executor: Placing {side_label} order @ {price:.2f}, "
-            f"size=${size:.2f}, postOnly={post_only}, "
-            f"signals=[{', '.join(s.signal_name for s in (decision.contributing_signals or []))}]"
+            f"size=${size:.2f}, postOnly={post_only}"
         )
 
         # Place the order
@@ -547,6 +552,23 @@ class V4Executor:
     def get_open_orders(self) -> List[OpenOrder]:
         return [o for o in self._open_orders.values() if o.fill_status == "OPEN"]
 
+    def get_balance(self) -> float:
+        """Fetch actual USDC balance directly from the Polygon blockchain."""
+        if self._client is None:
+            return 0.0
+        eoa = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
+        if not eoa:
+            return 0.0
+        from web3 import Web3
+        polygon_rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        w3 = Web3(Web3.HTTPProvider(polygon_rpc))
+        USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        USDC_ABI = [{"constant": True, "inputs": [{"name": "owner", "type": "address"}],
+                     "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}]
+        usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDR), abi=USDC_ABI)
+        raw = usdc.functions.balanceOf(Web3.to_checksum_address(eoa)).call()
+        return raw / 1e6
+
     def get_stats(self) -> Dict:
         """Executor stats for diagnostics."""
         statuses = {}
@@ -576,24 +598,40 @@ class V4Executor:
         Merges v2 fields with v3 ensemble fields.
         """
         direction = decision.direction.value if hasattr(decision.direction, 'value') else decision.direction
+        side_label = "YES" if direction == "UP" else "NO"
+
+        # Price: oracle path uses fill_price directly; ensemble path recomputes
+        if hasattr(decision, 'fill_price') and decision.fill_price and decision.fill_price > 0:
+            limit_price = round(float(decision.fill_price), 4)
+        else:
+            limit_price = self._compute_limit_price(decision, side_label)
+
+        # Size: oracle path uses size_usd; ensemble path uses recommended_size_usd
+        if hasattr(decision, 'size_usd') and decision.size_usd and decision.size_usd > 0:
+            size = decision.size_usd
+        else:
+            size = decision.recommended_size_usd
+
+        # Confidence/edge: oracle path uses confidence + magnitude; ensemble uses aggregate_confidence
+        oracle_confidence = getattr(decision, 'confidence', None) or getattr(decision, 'aggregate_confidence', None)
+        edge_bps = int(getattr(decision, 'magnitude_pct', 0) * 100) or int(getattr(decision, 'weighted_edge_bps', 0))
+        trade_reason = getattr(decision, 'reason', None)
 
         row = {
-            # v2 fields
             "market_id": market_info.get("condition_id"),
             "market_question": market_info.get("question"),
             "token_id": market_info.get("yes_token_id") if direction == "UP" else market_info.get("no_token_id"),
             "decision": "TRADE" if result.success else "SKIP",
             "skip_reason": result.error_msg if not result.success else None,
             "implied_direction": direction,
-            "side": "YES" if direction == "UP" else "NO",
-            "limit_price": self._compute_limit_price(decision, "YES" if direction == "UP" else "NO"),
-            "size_usdc": decision.recommended_size_usd,
+            "side": side_label,
+            "limit_price": limit_price,
+            "size_usdc": size,
             "order_id": result.order_id,
             "fill_status": result.fill_status,
-            "oracle_confidence": decision.aggregate_confidence,
-            "edge_bps": int(decision.weighted_edge_bps),
-            "trade_reason": decision.reason,
-            # v3 fields from ensemble
+            "oracle_confidence": oracle_confidence,
+            "edge_bps": edge_bps,
+            "trade_reason": trade_reason,
             **trade_enhancement,
         }
 

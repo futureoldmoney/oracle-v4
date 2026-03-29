@@ -177,7 +177,7 @@ class BotRunner:
 
     def __init__(self, env: dict, config: Optional[dict] = None):
         self.env = env
-        self.mode = env.get("BOT_MODE", "paper")
+        self.mode = env.get("BOT_MODE", "paper").lower()
         self.cycle_interval = float(env.get("CYCLE_INTERVAL", "2.0"))
         self._running = False
         # Retry-aware guard: tracks fill state per market window
@@ -261,11 +261,13 @@ class BotRunner:
         timed_out = result.get("timed_out", False)
 
         if not timed_out:
-            # Update orchestrator
+            # Update orchestrator — pass the stored ensemble_id from trade time,
+            # not self._last_ensemble_id which is overwritten every 2s by evaluate_cycle
             self.orchestrator.log_settlement(
                 result["actual_outcome"],
                 result["won"],
                 result["pnl"],
+                ensemble_id=result.get("ensemble_id"),
             )
 
             # Update bankroll
@@ -298,6 +300,7 @@ class BotRunner:
         condition_id = result["condition_id"]
 
         # Fetch the price_path from chainlink_windows for this trade's window
+        # and write the settled_outcome back to chainlink_windows
         price_path = None
         try:
             trade_check = self.supabase.table(table).select("window_start_ts").eq(
@@ -310,6 +313,13 @@ class BotRunner:
                 ).limit(1).execute()
                 if cw.data and cw.data[0].get("price_path"):
                     price_path = cw.data[0]["price_path"]
+                # Back-fill settled_outcome into chainlink_windows for post-analysis
+                try:
+                    self.supabase.table("chainlink_windows").update({
+                        "settled_outcome": result["actual_outcome"],
+                    }).eq("window_ts", wts).is_("settled_outcome", "null").execute()
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"Settlement: Could not fetch price_path: {e}")
 
@@ -476,6 +486,10 @@ class BotRunner:
                     if book:
                         mi["best_bid_yes"] = book.best_bid
                         mi["best_ask_yes"] = book.best_ask
+                    book_no = self.orchestrator._last_book_no
+                    if book_no:
+                        mi["best_bid_no"] = book_no.best_bid
+                        mi["best_ask_no"] = book_no.best_ask
 
                     oracle_decision = self.orchestrator.evaluate_v4(mi)
                 else:
@@ -508,19 +522,21 @@ class BotRunner:
                 # (timing, magnitude, edge at fill, daily loss, one-trade-per-window)
                 if oracle_decision.should_trade and self.mode == "live":
                     market_info = self._get_current_market_info()
+                    if not market_info:
+                        logger.warning("Oracle fired but market_info is None — skipping trade (race condition)")
                     if market_info:
                         result = self.executor.execute(
-                            decision,
+                            oracle_decision,           # ← oracle_decision, not ensemble decision
                             market_info,
                             self.orchestrator._last_ensemble_id,
-                            oracle_confirmed=True,  # Oracle gate passed above
+                            oracle_confirmed=True,
                         )
 
                         if result.success:
                             # Write trade row to Supabase
                             enhancement = self.orchestrator.get_trade_enhancement()
                             trade_row = self.executor.build_trade_row(
-                                result, decision, market_info,
+                                result, oracle_decision, market_info,
                                 self.orchestrator._last_ensemble_id or "",
                                 enhancement,
                             )
@@ -528,28 +544,24 @@ class BotRunner:
 
                             # Send Discord alert for live trade
                             self._send_trade_alert(
-                                decision, market_info,
-                                trade_row.get("limit_price", 0.50),
-                                decision.recommended_size_usd,
+                                oracle_decision, market_info,
+                                trade_row.get("limit_price", oracle_decision.fill_price or 0.50),
+                                oracle_decision.size_usd,
                                 row_id, paper=False,
                             )
 
                             # Track for settlement
                             live_wts = market_info.get("window_ts")
                             live_wend = (live_wts + 300) if live_wts else None
-                            live_sig_snapshot = [
-                                {"signal_name": s.signal_name, "direction": s.direction.value if hasattr(s.direction, 'value') else str(s.direction)}
-                                for s in (decision.contributing_signals or [])
-                            ]
                             self.settlement.track(
                                 condition_id=market_info["condition_id"],
                                 ensemble_id=self.orchestrator._last_ensemble_id or "",
-                                direction=decision.direction.value,
+                                direction=oracle_decision.direction,
                                 order_id=result.order_id,
-                                entry_price=trade_row.get("limit_price", 0.50),
-                                size_usd=decision.recommended_size_usd,
+                                entry_price=trade_row.get("limit_price", oracle_decision.fill_price or 0.50),
+                                size_usd=oracle_decision.size_usd,
                                 window_end_ts=live_wend,
-                                contributing_signals=live_sig_snapshot,
+                                contributing_signals=[],
                             )
 
                 elif oracle_decision.should_trade and self.mode == "paper":
@@ -720,6 +732,14 @@ class BotRunner:
                         # Only write to DB on first attempt or if filled on retry
                         if not _is_retry or would_fill:
                             row_id = self._write_trade_row(paper_row, paper=True)
+                            # Back-link trade_id into ensemble_log so Brain can join tables
+                            if row_id and self.orchestrator._last_ensemble_id:
+                                try:
+                                    self.supabase.table("ensemble_log").update(
+                                        {"trade_id": row_id}
+                                    ).eq("id", self.orchestrator._last_ensemble_id).execute()
+                                except Exception:
+                                    pass
                         else:
                             row_id = None
 
@@ -801,10 +821,11 @@ class BotRunner:
                 if self.mode == "live":
                     try:
                         wallet_balance = self.executor.get_balance()
+                        logger.info(f"Wallet balance sync: ${wallet_balance:.2f}")
                         if wallet_balance > 0:
                             self.orchestrator.update_bankroll(wallet_balance, persist=False)
                     except Exception as e:
-                        logger.debug(f"Wallet balance sync error: {e}")
+                        logger.warning(f"Wallet balance sync error: {e}")
 
                 diag = self.orchestrator.get_full_diagnostics()
                 feed_health = self.feed_coordinator.get_health()
@@ -840,6 +861,14 @@ class BotRunner:
 
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+                try:
+                    self.supabase.table("heartbeats_v2").insert({
+                        "status": "error",
+                        "bot_mode": self.mode,
+                        "error_message": str(e),
+                    }).execute()
+                except Exception:
+                    pass
 
             await asyncio.sleep(60)
 
@@ -973,6 +1002,7 @@ class BotRunner:
                         "avg_edge_bps": signal_stats.get("avg_pnl_bps", 0),
                         "current_weight": signal_stats.get("weight", 0),
                         "adjusted_weight": signal_stats.get("weight", 0),
+                        "avg_confidence": signal_stats.get("avg_confidence"),
                     }
                     try:
                         self.supabase.table("signal_snapshots").upsert(
@@ -1126,6 +1156,7 @@ class BotRunner:
                         our_token = trade.get("token_id", "")
                         winning_token = winner.get("token_id", "")
 
+                        direction = trade.get("implied_direction", "")
                         if our_token and winning_token:
                             won = (our_token == winning_token)
                         elif our_side:
@@ -1134,8 +1165,6 @@ class BotRunner:
                                 (our_side == "NO" and actual in ("DOWN", "NO"))
                             )
                         else:
-                            # Last resort fallback
-                            direction = trade.get("implied_direction", "")
                             won = (direction == actual)
 
                         entry = float(trade.get("hypothetical_price", 0.5) or 0.5)
@@ -1287,6 +1316,7 @@ class BotRunner:
                 "aggregate_confidence": trade.get("aggregate_confidence"),
                 "weighted_edge_bps": trade.get("weighted_edge_bps"),
                 "price_path": trade.get("price_path"),
+                "bankroll_after": settlement.get("bankroll_after"),
             }
             self.supabase.table("live_settled").upsert(
                 row, on_conflict="market_id"

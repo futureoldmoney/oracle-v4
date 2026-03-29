@@ -160,16 +160,31 @@ def estimate_fill_price(book_state: dict, direction: str) -> Optional[float]:
         For UP trades: we buy YES at best_ask_yes
         For DOWN trades: we buy NO at (1 - best_bid_yes)
     """
+    bid_yes = book_state.get("best_bid_yes")
+    ask_yes = book_state.get("best_ask_yes")
+
     if direction == "UP":
-        ask = book_state.get("best_ask_yes")
-        if ask is not None and 0.01 < ask < 0.99:
-            return float(ask)
+        # Buy YES — pay ask_yes
+        if ask_yes is not None and 0.01 <= ask_yes < 0.99:
+            return float(ask_yes)
+        # Fallback: infer YES ask from NO bid (1 - bid_no ≈ ask_yes)
+        bid_no = book_state.get("best_bid_no")
+        if bid_no is not None and 0.01 < bid_no < 0.99:
+            return round(1.0 - float(bid_no), 4)
         return None
-    else:  # DOWN
-        bid = book_state.get("best_bid_yes")
-        if bid is not None and 0.01 < bid < 0.99:
-            no_ask = 1.0 - float(bid)
-            return round(no_ask, 4)
+    else:  # DOWN — buy NO
+        # Primary: NO ask = 1 - bid_yes
+        if bid_yes is not None and 0.01 < bid_yes < 0.99:
+            return round(1.0 - float(bid_yes), 4)
+        # Fallback: use ask_no directly if available
+        ask_no = book_state.get("best_ask_no")
+        if ask_no is not None and 0.01 <= ask_no < 0.99:
+            return float(ask_no)
+        # Last resort: infer from ask_yes (when YES is nearly worthless, NO is cheap)
+        if ask_yes is not None and 0.0 < ask_yes < 0.50:
+            no_price = round(1.0 - float(ask_yes), 4)
+            if 0.50 < no_price < 0.99:
+                return no_price
         return None
 
 

@@ -46,6 +46,17 @@ CHAINLINK_KEYS = {
     # HYPE has no Chainlink feed
 }
 
+# Binance symbol mapping (all 7 assets have Binance feeds)
+BINANCE_KEYS = {
+    "btc": "btcusdt",
+    "eth": "ethusdt",
+    "sol": "solusdt",
+    "xrp": "xrpusdt",
+    "doge": "dogeusdt",
+    "bnb": "bnbusdt",
+    "hype": "hypeusdt",
+}
+
 
 @dataclass
 class AssetMarket:
@@ -190,12 +201,16 @@ class MultiAssetCollector:
                 except Exception:
                     pass
 
-                # 3. Chainlink price from router state
+                # 3. Chainlink + Binance prices from router state
                 chainlink_price = None
+                binance_price = None
                 if self._router:
                     cl_key = CHAINLINK_KEYS.get(asset)
                     if cl_key:
                         chainlink_price = self._router.get_chainlink_price(cl_key)
+                    bn_key = BINANCE_KEYS.get(asset)
+                    if bn_key:
+                        binance_price = self._router.get_binance_price(bn_key)
 
                 # 4. Trade flow from Data API
                 flow_up = 0.0
@@ -242,6 +257,7 @@ class MultiAssetCollector:
                     "window_ts": window_ts,
                     "asset": asset,
                     "chainlink_price": chainlink_price,
+                    "binance_price": binance_price,
                     "ltp": ltp,
                     "midpoint": midpoint,
                     "flow_up_volume": round(flow_up, 2),

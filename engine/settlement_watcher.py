@@ -294,7 +294,7 @@ class SettlementWatcher:
         del self._pending[condition_id]
 
         emoji = "✅" if won else "❌"
-        logger.info(f"Settlement (WS): {emoji} {condition_id[:16]}... pnl=${pnl:+.4f}")
+        logger.info(f"Settlement (WS): {emoji} {condition_id[:16]}... pnl=${pnl_data['net_pnl']:+.4f}")
 
         return result
 
