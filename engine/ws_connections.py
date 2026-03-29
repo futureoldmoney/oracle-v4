@@ -16,6 +16,7 @@ This replaces the stub in data_feeds.py WebSocketManager.
 """
 
 import json
+import os
 import time
 import asyncio
 import logging
@@ -694,6 +695,7 @@ class FeedCoordinator:
         Poll Binance REST API for BTC price as reliable fallback for RTDS.
         RTDS WebSocket often fails to deliver continuous price data.
         Injects prices into the router the same way RTDS would.
+        Routes through CLOB_PROXY_URL if set (Binance blocks US IPs with HTTP 451).
         """
         try:
             import httpx
@@ -705,9 +707,13 @@ class FeedCoordinator:
         poll_interval = 2.0  # Poll every 2 seconds
         _poll_count = 0
 
+        proxy_url = os.environ.get("CLOB_PROXY_URL")
+        if proxy_url:
+            logger.info(f"Binance poller: using proxy")
+
         while True:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                async with httpx.AsyncClient(timeout=5.0, proxy=proxy_url) as client:
                     resp = await client.get(BINANCE_URL, params={"symbol": "BTCUSDT"})
                     if resp.status_code == 200:
                         data = resp.json()
