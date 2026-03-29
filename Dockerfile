@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ARG CACHE_BUST=2026-03-29-v2
 
 WORKDIR /app
 
