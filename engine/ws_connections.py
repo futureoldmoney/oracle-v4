@@ -136,8 +136,19 @@ class RTDSFeed:
                         f"Chainlink {self._chainlink_symbols}"
                     )
 
-                    # Message loop
-                    async for raw in ws:
+                    # Message loop with staleness-triggered reconnect.
+                    # The server may keep the TCP/ping alive but stop sending
+                    # data — wait_for forces a reconnect if silent for 45s.
+                    RTDS_MSG_TIMEOUT = 45.0
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=RTDS_MSG_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"RTDS: No data for {RTDS_MSG_TIMEOUT:.0f}s — forcing reconnect"
+                            )
+                            raise ConnectionError("RTDS stale")
+
                         self._last_msg_time = time.time()
                         self._msg_count += 1
 

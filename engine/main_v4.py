@@ -455,24 +455,22 @@ class StrategyOrchestrator:
     def _register_signals(self):
         """Register all signals with the ensemble."""
         c = self.config
-        self.registry.register("ORACLE_CONFIDENCE",
-                               weight=c["weight_oracle_confidence"],
-                               min_confidence=c["min_conf_oracle_confidence"])
-        self.registry.register("STALE_QUOTE",
-                               weight=c["weight_stale_quote"],
-                               min_confidence=c["min_conf_stale_quote"])
-        self.registry.register("LIQUIDITY_VACUUM",
-                               weight=c["weight_liquidity_vacuum"],
-                               min_confidence=c["min_conf_liquidity_vacuum"])
-        self.registry.register("COMPLEMENT_ARB",
-                               weight=c["weight_complement_arb"],
-                               min_confidence=c["min_conf_complement_arb"])
-        self.registry.register("WHALE_FLOW",
-                               weight=c["weight_whale_flow"],
-                               min_confidence=c["min_conf_whale_flow"])
-        self.registry.register("OB_IMBALANCE",
-                               weight=c["weight_ob_imbalance"],
-                               min_confidence=c["min_conf_ob_imbalance"])
+        signals = [
+            ("ORACLE_CONFIDENCE", c["weight_oracle_confidence"],  c["min_conf_oracle_confidence"]),
+            ("STALE_QUOTE",       c["weight_stale_quote"],        c["min_conf_stale_quote"]),
+            ("LIQUIDITY_VACUUM",  c["weight_liquidity_vacuum"],   c["min_conf_liquidity_vacuum"]),
+            ("COMPLEMENT_ARB",    c["weight_complement_arb"],     c["min_conf_complement_arb"]),
+            ("WHALE_FLOW",        c["weight_whale_flow"],         c["min_conf_whale_flow"]),
+            ("OB_IMBALANCE",      c["weight_ob_imbalance"],       c["min_conf_ob_imbalance"]),
+        ]
+        for name, weight, min_conf in signals:
+            try:
+                self.registry.register(name, weight=weight, min_confidence=min_conf)
+            except Exception as e:
+                logger.error(f"Failed to register signal {name}: {e}")
+
+        registered = list(self.registry._signals.keys())
+        logger.info(f"Signal registration complete: {registered} ({len(registered)}/6)")
 
     def _wire_callbacks(self):
         """Connect data router to signal ingestion methods."""

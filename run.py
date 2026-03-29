@@ -202,7 +202,18 @@ class BotRunner:
         # Initialize components
         logger.info(f"Initializing bot in {self.mode} mode...")
 
-        self.clob_client = init_clob_client(env)
+        # CLOB client: non-fatal in paper mode — cred derivation can timeout on
+        # Railway cold start. Paper mode doesn't place real orders so we can
+        # proceed with clob_client=None and retry settlement checks gracefully.
+        try:
+            self.clob_client = init_clob_client(env)
+        except Exception as e:
+            if self.mode == "paper":
+                logger.warning(f"CLOB client init failed (paper mode — continuing): {e}")
+                self.clob_client = None
+            else:
+                raise
+
         self.supabase = init_supabase(env)
 
         self.orchestrator = StrategyOrchestrator(full_config)
