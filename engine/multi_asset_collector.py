@@ -170,9 +170,9 @@ class MultiAssetCollector:
                     )
                     if resp.status_code == 200:
                         book_data = resp.json()
-                        ltp = book_data.get("last_trade_price")
-                        if ltp is not None:
-                            ltp = float(ltp)
+                        raw_ltp = book_data.get("last_trade_price")
+                        if raw_ltp not in (None, ""):
+                            ltp = float(raw_ltp)
                 except Exception:
                     pass
 
