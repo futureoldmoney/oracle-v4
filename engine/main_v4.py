@@ -486,6 +486,16 @@ class StrategyOrchestrator:
         self._cycle_count += 1
         now = time.time()
 
+        # ═══════════════════════════════════════════════════
+        # ALWAYS update ChainlinkWindowTracker — even outside
+        # the trading window. Must capture the window OPEN price
+        # at the start of each 5-min window, not just in the
+        # last 120 seconds.
+        # ═══════════════════════════════════════════════════
+        _cl_price = self.router.state.chainlink_btc
+        if _cl_price and _cl_price > 0:
+            self.chainlink_tracker.update(_cl_price)
+
         # Default regime for early-exit decisions
         _default_regime = RegimeState(
             spread_percentile=50.0, volatility_1m=0.0,
@@ -512,28 +522,9 @@ class StrategyOrchestrator:
             return self._last_decision
 
         # ═══════════════════════════════════════════════════
-        # ORACLE GATE: Chainlink must show directional move
-        # ═══════════════════════════════════════════════════
-        chainlink_price = self.router.state.chainlink_btc
-        oracle_decision = self.oracle_strategy.evaluate(
-            chainlink_tracker=self.chainlink_tracker,
-            seconds_remaining=secs,
-            chainlink_price=chainlink_price,
-            ltp=self._get_midpoint(),
-        )
-        if not oracle_decision.should_trade:
-            self._last_decision = EnsembleDecision(
-                direction=Direction.NEUTRAL,
-                aggregate_confidence=0.0, weighted_edge_bps=0.0,
-                kelly_fraction=0.0, recommended_size_usd=0.0,
-                contributing_signals=[], regime=_default_regime.label,
-                should_trade=False,
-                reason=f"Oracle gate: {oracle_decision.reason}",
-            )
-            return self._last_decision
-
-        # ═══════════════════════════════════════════════════
-        # PASSED BOTH GATES — evaluate ensemble signals as amplifiers
+        # v4: Oracle gate removed from evaluate_cycle().
+        # Trade decisions go through evaluate_v4() in run.py.
+        # evaluate_cycle() only runs ensemble signals for logging.
         # ═══════════════════════════════════════════════════
 
         all_signals = []
