@@ -158,6 +158,7 @@ class ChainlinkWindowTracker:
         self._price_path: List[Dict] = []  # [{t: unix_ts, p: price}, ...]
         self._last_sample_ts: float = 0.0
         self._history: deque = deque(maxlen=50)  # Last 50 windows
+        self._last_price: float = 0.0
 
     def _get_window_start(self, ts: Optional[float] = None) -> int:
         """Get the 5-min window start timestamp."""
@@ -173,6 +174,7 @@ class ChainlinkWindowTracker:
         if chainlink_price <= 0:
             return
 
+        self._last_price = chainlink_price
         window_start = self._get_window_start()
 
         if window_start != self._current_window_start:
@@ -256,6 +258,20 @@ class ChainlinkWindowTracker:
     @property
     def current_window_start(self) -> int:
         return self._current_window_start
+
+    def get_current_move(self) -> Optional[Dict]:
+        """
+        Get current window move data (no arguments needed).
+        Used by oracle_strategy._get_chainlink_data().
+        """
+        if not self._window_open_price or self._last_price <= 0:
+            return None
+        move_pct = ((self._last_price - self._window_open_price) / self._window_open_price) * 100.0
+        return {
+            "move_pct": move_pct,
+            "current_price": self._last_price,
+            "open_price": self._window_open_price,
+        }
 
     def get_direction(self, current_chainlink: float, min_move_pct: float = 0.01) -> str:
         """
