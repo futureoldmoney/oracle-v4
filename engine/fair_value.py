@@ -37,42 +37,55 @@ EMPIRICAL_WIN_RATES = {
     (0.20, 0.20): 0.88,
     (0.15, 0.20): 0.84,
     (0.12, 0.20): 0.80,
+    (0.08, 0.20): 0.75,
     # Mid window — moderate moves tradeable
     (0.20, 0.40): 0.92,
     (0.15, 0.40): 0.89,
     (0.12, 0.40): 0.86,
     (0.08, 0.40): 0.82,
+    (0.06, 0.40): 0.78,
+    (0.04, 0.40): 0.72,
     # Sweet spot (60-120s remaining)
     (0.20, 0.60): 0.96,
     (0.15, 0.60): 0.95,
     (0.12, 0.60): 0.93,
     (0.08, 0.60): 0.90,
+    (0.06, 0.60): 0.87,
     (0.05, 0.60): 0.85,
+    (0.04, 0.60): 0.80,
+    (0.03, 0.60): 0.72,
     # Primary zone (60-90s remaining = 70-80% through)
     (0.20, 0.75): 0.99,
     (0.15, 0.75): 0.98,
     (0.12, 0.75): 0.97,
     (0.08, 0.75): 0.95,
+    (0.06, 0.75): 0.93,
     (0.05, 0.75): 0.90,
+    (0.04, 0.75): 0.85,
+    (0.03, 0.75): 0.78,
     # Late window (30-60s remaining)
     (0.20, 0.85): 0.99,
     (0.15, 0.85): 0.99,
     (0.12, 0.85): 0.99,
     (0.08, 0.85): 0.97,
+    (0.06, 0.85): 0.95,
     (0.05, 0.85): 0.92,
-    (0.03, 0.85): 0.85,
+    (0.04, 0.85): 0.88,
+    (0.03, 0.85): 0.82,
 }
 
 # Continuous monitoring thresholds: minimum magnitude to trade at each timing
+# Lowered from original v4 values to trade in low-volatility environments
+# (F&G=9, typical BTC 5-min move is 0.02-0.06%)
 TIMING_THRESHOLDS = [
     # (max_seconds_remaining, min_magnitude_pct, base_confidence)
-    (300, 0.20, 0.88),   # 0-60s into window — only massive moves
-    (240, 0.15, 0.84),   # 60-120s into window
-    (180, 0.12, 0.90),   # 120-180s into window
-    (120, 0.08, 0.93),   # 180-240s into window (sweet spot begins)
-    (60,  0.05, 0.90),   # 240-270s into window (primary zone)
-    (30,  0.05, 0.92),   # 270-300s into window (late, needs LTP confirm)
-    (0,   999,  0.00),   # Too late — never trade
+    (300, 0.15, 0.85),   # 0-60s into window — only large moves
+    (240, 0.10, 0.82),   # 60-120s into window
+    (180, 0.08, 0.88),   # 120-180s into window
+    (120, 0.06, 0.91),   # 180-240s into window (sweet spot begins)
+    (60,  0.04, 0.88),   # 240-270s into window (primary zone)
+    (30,  0.04, 0.90),   # 270-300s into window (late, needs LTP confirm)
+    (20,  999,  0.00),   # Too late — never trade (matches Gate 2's <20s cutoff)
 ]
 
 
@@ -90,8 +103,10 @@ def get_required_magnitude(seconds_remaining: int) -> float:
     if seconds_remaining < 20:
         return 999.0  # Too late for fills
 
+    # Find the threshold bracket: return the magnitude for the first entry
+    # where seconds_remaining > max_secs (meaning we've passed that time point)
     for max_secs, min_mag, _ in TIMING_THRESHOLDS:
-        if seconds_remaining <= max_secs:
+        if seconds_remaining < max_secs:
             continue
         return min_mag
 
@@ -118,8 +133,8 @@ def compute_fair_value(magnitude_pct: float, seconds_remaining: int) -> float:
     pct_through = max(0.0, min(1.0, pct_through))
     abs_mag = abs(magnitude_pct)
 
-    if abs_mag < 0.03:
-        return 0.50  # No edge below 0.03%
+    if abs_mag < 0.02:
+        return 0.50  # No edge below 0.02%
 
     # Find the two closest entries in the empirical table and interpolate
     best_match = 0.50
