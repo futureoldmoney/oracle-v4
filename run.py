@@ -177,7 +177,8 @@ class BotRunner:
 
     def __init__(self, env: dict, config: Optional[dict] = None):
         self.env = env
-        self.mode = env.get("BOT_MODE", "paper").lower()
+        self._env_mode = env.get("BOT_MODE", "paper").lower()  # env var as fallback only
+        self.mode = self._env_mode  # will be overridden by Supabase below
         self.cycle_interval = float(env.get("CYCLE_INTERVAL", "2.0"))
         self._running = False
         # Retry-aware guard: tracks fill state per market window
@@ -199,6 +200,22 @@ class BotRunner:
         # Merge config
         full_config = {**DEFAULT_CONFIG, **(config or {})}
 
+        # Initialize Supabase early so we can read bot_control
+        self.supabase = init_supabase(env)
+
+        # Read mode from Supabase bot_control (Discord !mode writes here)
+        # Falls back to Railway env var if Supabase is unavailable
+        try:
+            ctrl = self.supabase.table("bot_control").select("bot_mode").eq("id", 1).execute()
+            if ctrl.data and ctrl.data[0].get("bot_mode"):
+                db_mode = ctrl.data[0]["bot_mode"].lower()
+                if db_mode in ("paper", "live"):
+                    self.mode = db_mode
+                    if db_mode != self._env_mode:
+                        logger.info(f"Mode from Supabase bot_control: {db_mode} (env var was {self._env_mode})")
+        except Exception as e:
+            logger.warning(f"Could not read bot_control — using env var '{self._env_mode}': {e}")
+
         # Initialize components
         logger.info(f"Initializing bot in {self.mode} mode...")
 
@@ -214,7 +231,7 @@ class BotRunner:
             else:
                 raise
 
-        self.supabase = init_supabase(env)
+        # self.supabase already initialized above (for bot_control mode read)
 
         self.orchestrator = StrategyOrchestrator(full_config)
         self.orchestrator.set_supabase(self.supabase, mode=self.mode)
@@ -811,11 +828,24 @@ class BotRunner:
             await asyncio.sleep(10)
 
     async def _heartbeat_loop(self):
-        """Log health status, hot-reload config, and write heartbeat to Supabase."""
+        """Log health status, hot-reload config, sync mode, and write heartbeat to Supabase."""
         while self._running:
             try:
                 # Hot-reload config from bot_config table
                 self.orchestrator.reload_config()
+
+                # Sync mode from bot_control (Discord !mode writes here)
+                try:
+                    ctrl = self.supabase.table("bot_control").select("bot_mode, paused").eq("id", 1).execute()
+                    if ctrl.data and ctrl.data[0].get("bot_mode"):
+                        new_mode = ctrl.data[0]["bot_mode"].lower()
+                        if new_mode in ("paper", "live") and new_mode != self.mode:
+                            old_mode = self.mode
+                            self.mode = new_mode
+                            self.orchestrator.set_supabase(self.supabase, mode=new_mode)
+                            logger.info(f"MODE CHANGED via bot_control: {old_mode} → {new_mode}")
+                except Exception:
+                    pass  # Non-critical — keep running in current mode
 
                 # Live mode: sync bankroll from actual wallet USDC balance
                 if self.mode == "live":
