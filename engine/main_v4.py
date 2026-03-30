@@ -485,9 +485,24 @@ class StrategyOrchestrator:
             self.tier1.ingest_book_snapshot(book)
             self.vacuum_detector.ingest_book(book)
             self.ob_imbalance.ingest_book(book)
-            # Store for complement arb (needs both YES and NO books)
-            # In production, distinguish by asset_id
+            # Store YES book
             self._last_book_yes = book
+            # Derive NO book from YES (binary market: YES + NO ≈ $1)
+            # This ensures complement arb and other signals have both sides
+            try:
+                from engine.tier1_signals import OrderBookSnapshot, BookLevel
+                no_bids = [BookLevel(price=round(1.0 - a.price, 4), size=a.size)
+                           for a in (book.asks or []) if 0.01 < a.price < 0.99]
+                no_asks = [BookLevel(price=round(1.0 - b.price, 4), size=b.size)
+                           for b in (book.bids or []) if 0.01 < b.price < 0.99]
+                no_bids.sort(key=lambda x: x.price, reverse=True)
+                no_asks.sort(key=lambda x: x.price)
+                self._last_book_no = OrderBookSnapshot(
+                    bids=no_bids, asks=no_asks,
+                    timestamp=book.timestamp, book_hash="",
+                )
+            except Exception:
+                pass  # Non-critical — evaluate_v4 has its own fallback
 
         self.router.on_book_update(on_book)
 
@@ -647,9 +662,25 @@ class StrategyOrchestrator:
         seconds_remaining = market_info.get("seconds_before_close", 999)
         window_ts = market_info.get("window_ts")
 
+        # Book data: prefer WS book snapshot keys (best_bid_yes/best_ask_yes)
+        # injected by run.py, fall back to scanner's keys (best_bid/best_ask)
+        bid_yes = (
+            market_info.get("best_bid_yes")
+            or market_info.get("best_bid")
+            or (self._last_book_yes.best_bid if self._last_book_yes else None)
+        )
+        ask_yes = (
+            market_info.get("best_ask_yes")
+            or market_info.get("best_ask")
+            or (self._last_book_yes.best_ask if self._last_book_yes else None)
+        )
+
         book_state = {
-            "best_bid_yes": market_info.get("best_bid_yes"),
-            "best_ask_yes": market_info.get("best_ask_yes"),
+            "best_bid_yes": bid_yes,
+            "best_ask_yes": ask_yes,
+            # Derive NO book from YES for binary markets (YES + NO ≈ $1)
+            "best_bid_no": round(1.0 - ask_yes, 4) if ask_yes else None,
+            "best_ask_no": round(1.0 - bid_yes, 4) if bid_yes else None,
         }
 
         decision = self.oracle_strategy.evaluate(
